@@ -5,6 +5,7 @@ use rand::{
     distributions::{Distribution, Standard},
     Rng,
 };
+use std::collections::HashMap;
 
 fn main() {
     App::build()
@@ -12,11 +13,9 @@ fn main() {
         .add_resource(SoftDropTimer(Timer::from_seconds(0.750)))
         .add_resource(PrintInfoTimer(Timer::from_seconds(1.0)))
         .add_startup_system(setup.system())
-        .add_system(print_info.system())
+        // .add_system(print_info.system())
         .add_system(move_current_tetromino.system())
-        .add_system(rotate_current_tetromino.system())
-        .add_system(keep_current_tetromino_in_bounds.system())
-        .add_system(add_current_to_heap_and_spawn_new.system())
+        .add_system(update_block_sprites.system())
         .run();
 }
 
@@ -29,10 +28,13 @@ struct Block {
     color: Color,
 }
 
-struct Matrix;
+struct Matrix {
+    width: i32,
+    height: i32,
+}
 
-// A block can be positioned on the matrix, either as part of the current
-// tetromino or as part of the heap.
+// Holds a block's position within a tetromino for rotation
+#[derive(Debug)]
 struct MatrixPosition {
     x: i32,
     y: i32,
@@ -40,6 +42,7 @@ struct MatrixPosition {
 
 // A block can be part of a tetromino. Stores the block's index within that
 // tetromino for the purpose of rotation.
+#[derive(Debug)]
 struct Tetromino {
     tetromino_type: TetrominoType,
     index: MatrixPosition,
@@ -55,8 +58,7 @@ struct HeldTetromino;
 // added to the heap.
 struct AlreadyHeld(bool);
 
-// A block can be part of one of the tetrominos that are next in line. Stores
-// the position of that tetromino in line.
+// A block can be part of one of the tetrominos that are next in line.
 struct NextTetromino {
     pos_in_line: u8,
 }
@@ -68,15 +70,298 @@ impl Block {
     const SIZE: f32 = 25.0;
 }
 
-#[derive(Copy, Clone)]
+fn setup(
+    mut commands: Commands,
+    mut materials: ResMut<Assets<ColorMaterial>>
+) {
+    let matrix = Matrix {
+        width: 10,
+        height: 22,
+    };
+
+    commands
+        .spawn(Camera2dComponents::default())
+        .spawn(UiCameraComponents::default())
+    ;
+
+    spawn_current_tetromino(&mut commands, &matrix, &mut materials);
+
+    commands
+        .spawn(SpriteComponents {
+            material: materials.add(Color::rgb(0.0, 0.0, 0.0).into()),
+            sprite: Sprite {
+                size: Vec2::new(matrix.width as f32 * Block::SIZE, matrix.height as f32 * Block::SIZE),
+            },
+            ..Default::default()
+        })
+        .with(matrix)
+    ;
+}
+
+fn print_info(
+    time: Res<Time>,
+    mut timer: ResMut<PrintInfoTimer>,
+    mut matrix_query: Query<(&Matrix, &Sprite, &Translation)>,
+    mut current_query: Query<(&MatrixPosition, &Tetromino, &CurrentTetromino)>
+) {
+    timer.0.tick(time.delta_seconds);
+
+    if timer.0.finished {
+        for (position, tetromino, _current) in &mut current_query.iter() {
+            println!("Current matrix_pos: {:?}", position);
+            println!("Current tetromino: {:?}", tetromino);
+        }
+        println!("");
+        timer.0.reset();
+    }
+}
+
+fn move_current_tetromino(
+    mut commands: Commands,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    time: Res<Time>,
+    mut soft_drop_timer: ResMut<SoftDropTimer>,
+    keyboard_input: Res<Input<KeyCode>>,
+    mut matrix_query: Query<&Matrix>,
+    mut current_query: Query<(Entity, &mut MatrixPosition, &mut Tetromino, &CurrentTetromino)>,
+    mut heap_query: Query<(&mut MatrixPosition, &Heap)>
+) {
+    // Store current positions in map by entity ID
+    let mut prev_positions: HashMap<u32, (i32, i32)> = HashMap::new();
+    for (entity, position, _tetromino, _current) in &mut current_query.iter() {
+        prev_positions.insert(entity.id(), (position.x, position.y));
+    }
+
+    if keyboard_input.just_pressed(KeyCode::I) || keyboard_input.just_pressed(KeyCode::Up) {
+        while check_tetromino_positions(&mut current_query, &mut heap_query) {
+            for (_entity, mut position, _tetromino, _current) in &mut current_query.iter() {
+                position.y -= 1;
+            }
+        }
+
+        for (entity, mut position, _tetromino, _current) in &mut current_query.iter() {
+            position.y += 1;
+            commands.remove_one::<CurrentTetromino>(entity);
+            commands.insert_one(entity, Heap);
+        }
+
+        for matrix in &mut matrix_query.iter() {
+            spawn_current_tetromino(&mut commands, matrix, &mut materials);
+        }
+
+        return;
+    }
+
+    // Movement
+    soft_drop_timer.0.tick(time.delta_seconds);
+
+    let mut move_x = 0;
+    let mut move_y = 0;
+    if keyboard_input.just_pressed(KeyCode::J) || keyboard_input.just_pressed(KeyCode::Left) {
+        move_x -= 1;
+    }
+
+    if keyboard_input.just_pressed(KeyCode::L) || keyboard_input.just_pressed(KeyCode::Right) {
+        move_x += 1;
+    }
+
+    if keyboard_input.just_pressed(KeyCode::K) || keyboard_input.just_pressed(KeyCode::Down) || soft_drop_timer.0.finished {
+        move_y -= 1;
+        soft_drop_timer.0.reset();
+    }
+
+    if soft_drop_timer.0.finished {
+        soft_drop_timer.0.reset();
+    }
+
+    let mut should_rotate: Option<bool> = None;
+    if keyboard_input.just_pressed(KeyCode::X) {
+        should_rotate = Some(true);
+    }
+
+    if keyboard_input.just_pressed(KeyCode::Z) {
+        should_rotate = Some(false);
+    }
+
+    let mut x_over = 0;
+    let mut y_over = 0;
+
+    for (_entity, mut position, mut tetromino, _current) in &mut current_query.iter() {
+        let mut move_x = move_x;
+        let mut move_y = move_y;
+
+        // Rotation
+        if let Some(clockwise) = should_rotate {
+            let prev_index_x = tetromino.index.x;
+            let prev_index_y = tetromino.index.y;
+
+            let matrix_size = Tetromino::SIZES[tetromino.tetromino_type as usize];
+            rotate_tetromino_block(&mut tetromino, matrix_size, clockwise);
+
+            move_x += tetromino.index.x - prev_index_x;
+            move_y += tetromino.index.y - prev_index_y;
+        }
+
+        // Bounds
+        for matrix in &mut matrix_query.iter() {
+            if position.x + move_x < 0 {
+                x_over = (position.x + move_x).min(x_over);
+
+            } else if position.x + move_x >= matrix.width {
+                x_over = ((position.x + move_x) - matrix.width + 1).max(x_over);
+            }
+        }
+
+        position.x += move_x;
+        position.y += move_y;
+    }
+
+    for (_entity, mut position, mut tetromino, _current) in &mut current_query.iter() {
+        position.x -= x_over;
+        position.y -= y_over;
+    }
+
+    // TODO: Probably better off setting the matrix up so you can index into it to look for occupied spots around the current tetromino
+    // Check if any blocks in tetromino are overlapping with heap
+    if !check_tetromino_positions(&mut current_query, &mut heap_query) {
+        let mut should_revert = true;
+
+        if let Some(_) = should_rotate {
+            let try_moves = [
+                ( 1,  0),
+                ( 2,  0),
+                (-1,  0),
+                (-2,  0),
+                (-1, -2), // T spins
+                ( 1, -2),
+            ];
+
+            for try_move in try_moves.iter() {
+                for (_entity, mut position, _tetromino, _current) in &mut current_query.iter() {
+                    position.x += try_move.0;
+                    position.y += try_move.1;
+                }
+
+                if check_tetromino_positions(&mut current_query, &mut heap_query) {
+                    should_revert = false;
+                    break;
+                }
+            }
+        } else {
+            // Revert movement and add to heap
+            for (entity, _position, _tetromino, _current) in &mut current_query.iter() {
+                commands.remove_one::<CurrentTetromino>(entity);
+                commands.insert_one(entity, Heap);
+            }
+
+            for matrix in &mut matrix_query.iter() {
+                spawn_current_tetromino(&mut commands, matrix, &mut materials);
+            }
+        }
+
+        if should_revert {
+            for (entity, mut position, _tetromino, _current) in &mut current_query.iter() {
+                let prev_position = prev_positions.get(&entity.id()).unwrap();
+                position.x = prev_position.0;
+                position.y = prev_position.1;
+            }
+        }
+    }
+}
+
+fn update_block_sprites(
+    mut matrix_query: Query<(&Matrix, &Sprite)>,
+    mut block_query: Query<(&MatrixPosition, &mut Translation)>
+) {
+    for (_matrix, matrix_sprite) in &mut matrix_query.iter() {
+        for (position, mut translation) in &mut block_query.iter() {
+            let new_x: f32 = ((position.x as f32 * Block::SIZE) - (matrix_sprite.size.x() * 0.5)) + (Block::SIZE * 0.5);
+            let new_y: f32 = (matrix_sprite.size.y() * -0.5) + (position.y as f32 * Block::SIZE) + (Block::SIZE * 0.5);
+
+            *translation.x_mut() = new_x;
+            *translation.y_mut() = new_y;
+        }
+    }
+}
+
+// ----------------
+// UTILITY AND IMPL
+// ----------------
+
+fn rotate_tetromino_block(tetromino_block: &mut Tetromino, matrix_size: i32, clockwise: bool) {
+    let orig_x = tetromino_block.index.x;
+    let orig_y = tetromino_block.index.y;
+    let matrix_size = matrix_size - 1;
+
+    let x = orig_x;
+    if clockwise {
+        tetromino_block.index.x = orig_y;
+        tetromino_block.index.y = matrix_size - x;
+    } else {
+        tetromino_block.index.x = matrix_size - orig_y;
+        tetromino_block.index.y = orig_x;
+    }
+}
+
+fn check_tetromino_positions(
+    current_query: &mut Query<(Entity, &mut MatrixPosition, &mut Tetromino, &CurrentTetromino)>,
+    heap_query: &mut Query<(&mut MatrixPosition, &Heap)>
+) -> bool {
+    for (_entity, position, _tetromino, _current) in &mut current_query.iter() {
+        if position.y < 0 {
+            return false;
+        }
+
+        for (heap_position, _heap) in &mut heap_query.iter() {
+            if position.x == heap_position.x && position.y == heap_position.y {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+fn spawn_current_tetromino(
+    commands: &mut Commands,
+    matrix: &Matrix,
+    materials: &mut ResMut<Assets<ColorMaterial>>,
+) {
+    let blocks = Tetromino::blocks_from_type(rand::random());
+    for block in blocks.into_iter() {
+        let tetromino_matrix_size = Tetromino::SIZES[block.1.tetromino_type as usize];
+        commands
+            .spawn(SpriteComponents {
+                material: materials.add(Color::rgb(
+                    block.0.color.r,
+                    block.0.color.g,
+                    block.0.color.b
+                ).into()),
+                sprite: Sprite {
+                    size: Vec2::new(Block::SIZE, Block::SIZE),
+                },
+                translation: Translation(Vec3::new(0.0, 0.0, 1.0)),
+                ..Default::default()
+            })
+            .with(CurrentTetromino)
+            .with(MatrixPosition {
+                x: block.1.index.x + 3,
+                y: matrix.height - tetromino_matrix_size + block.1.index.y,
+            })
+            .with_bundle(block)
+        ;
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
 enum TetrominoType {
-    Line    = 0,
-    Square  = 1,
-    T       = 2,
-    S       = 3,
-    Z       = 4,
-    L       = 5,
-    J       = 6,
+    I = 0,
+    O = 1,
+    T = 2,
+    S = 3,
+    Z = 4,
+    L = 5,
+    J = 6,
 }
 
 impl Tetromino {
@@ -156,7 +441,10 @@ impl Tetromino {
                         color: Color::rgb(color.0, color.1, color.2),
                     },
                     Tetromino {
-                        index: MatrixPosition { x: index.0, y: index.1 },
+                        index: MatrixPosition {
+                            x: index.0,
+                            y: index.1,
+                        },
                         tetromino_type
                     }
                 )
@@ -165,225 +453,11 @@ impl Tetromino {
     }
 }
 
-fn setup(
-    mut commands: Commands,
-    mut materials: ResMut<Assets<ColorMaterial>>
-) {
-    commands
-        .spawn(Camera2dComponents::default())
-        .spawn(UiCameraComponents::default())
-        .spawn(SpriteComponents {
-            material: materials.add(Color::rgb(0.0, 0.0, 0.0).into()),
-            sprite: Sprite {
-                size: Vec2::new(Block::SIZE * 10.0, Block::SIZE * 22.0),
-            },
-            ..Default::default()
-        })
-        .with(Matrix)
-    ;
-
-    spawn_current_tetromino(commands, materials);
-}
-
-fn print_info(
-    time: Res<Time>,
-    mut timer: ResMut<PrintInfoTimer>,
-    mut matrix_query: Query<(&Matrix, &Sprite, &Translation)>,
-    mut current_query: Query<(&CurrentTetromino, &Translation)>
-) {
-    timer.0.tick(time.delta_seconds);
-
-    if timer.0.finished {
-        for matrix in &mut matrix_query.iter() {
-            println!("Matrix size: {:?}", matrix.1.size);
-            println!("Matrix translation: {:?}", matrix.2);
-        }
-
-        for current in &mut current_query.iter() {
-            println!("Current translation: {:?}", current.1);
-        }
-        timer.0.reset();
-    }
-}
-
-fn move_current_tetromino(
-    time: Res<Time>,
-    mut soft_drop_timer: ResMut<SoftDropTimer>,
-    keyboard_input: Res<Input<KeyCode>>,
-    mut current_query: Query<(&mut Tetromino, &CurrentTetromino, &mut Translation)>
-) {
-    soft_drop_timer.0.tick(time.delta_seconds);
-
-    let mut move_x = 0.0;
-    let mut move_y = 0.0;
-    if keyboard_input.just_pressed(KeyCode::J) {
-        move_x -= Block::SIZE;
-    }
-
-    if keyboard_input.just_pressed(KeyCode::L) {
-        move_x += Block::SIZE;
-    }
-
-    if keyboard_input.just_pressed(KeyCode::K) || soft_drop_timer.0.finished {
-        move_y -= Block::SIZE;
-        soft_drop_timer.0.reset();
-    }
-
-    for (_tetromino, _current, mut translation) in &mut current_query.iter() {
-        *translation.x_mut() += move_x;
-        *translation.y_mut() += move_y;
-    }
-
-    if soft_drop_timer.0.finished {
-        soft_drop_timer.0.reset();
-    }
-}
-
-fn rotate_current_tetromino(
-    keyboard_input: Res<Input<KeyCode>>,
-    mut query: Query<(&mut Tetromino, &CurrentTetromino, &mut Translation)>
-) {
-    let mut should_rotate: Option<bool> = None;
-    if keyboard_input.just_pressed(KeyCode::X) {
-        should_rotate = Some(true);
-    }
-
-    if keyboard_input.just_pressed(KeyCode::Z) {
-        should_rotate = Some(false);
-    }
-
-    if let Some(clockwise) = should_rotate {
-        for (mut tetromino, _current, mut translation) in &mut query.iter() {
-            let prev_index_x = tetromino.index.x;
-            let prev_index_y = tetromino.index.y;
-
-            let matrix_size = Tetromino::SIZES[tetromino.tetromino_type as usize];
-            rotate_tetromino_block(&mut tetromino, matrix_size, clockwise);
-
-            *translation.x_mut() +=
-                (tetromino.index.x - prev_index_x) as f32 * Block::SIZE;
-            *translation.y_mut() +=
-                (tetromino.index.y - prev_index_y) as f32 * Block::SIZE;
-        }
-    }
-}
-
-fn keep_current_tetromino_in_bounds(
-    mut matrix_query: Query<(&Matrix, &Sprite)>,
-    mut current_query: Query<(&CurrentTetromino, &mut Translation)>,
-) {
-    let mut out_of_bounds: Option<Vec2> = None;
-
-    for (_current, translation) in &mut current_query.iter() {
-        for (_matrix, matrix_sprite) in &mut matrix_query.iter() {
-            if translation.x() < matrix_sprite.size.x() * -0.5 {
-                out_of_bounds = Some(Vec2::new(Block::SIZE * -1.0, 0.0));
-                break;
-            } else if translation.x() >= matrix_sprite.size.x() * 0.5 {
-                out_of_bounds = Some(Vec2::new(Block::SIZE, 0.0));
-                break;
-            }
-        }
-    }
-
-    if let Some(difference) = out_of_bounds {
-        for (_current, mut translation) in &mut current_query.iter() {
-            *translation.x_mut() -= difference.x();
-            *translation.y_mut() -= difference.y();
-        }
-    }
-}
-
-fn add_current_to_heap_and_spawn_new(
-    mut commands: Commands,
-    materials: ResMut<Assets<ColorMaterial>>,
-    mut matrix_query: Query<(&Matrix, &Sprite, &Translation)>,
-    mut current_query: Query<(Entity, &mut CurrentTetromino, &mut Translation)>,
-    mut heap_query: Query<(&Heap, &Translation)>
-) {
-    let mut should_go_to_heap = false;
-
-    for (_entity, _current_tetromino, current_translation) in &mut current_query.iter() {
-        for (_matrix, sprite, _translation) in &mut matrix_query.iter() {
-            if current_translation.0.y() <= sprite.size.y() * -0.5 {
-                should_go_to_heap = true;
-                break;
-            }
-        }
-
-        for (_heap, heap_translation) in &mut heap_query.iter() {
-            if current_translation.0 == heap_translation.0 {
-                should_go_to_heap = true;
-                break;
-            }
-        }
-    }
-
-    if should_go_to_heap {
-        for (entity, _current, mut translation) in &mut current_query.iter() {
-            commands.remove_one::<CurrentTetromino>(entity);
-            commands.insert_one(entity, Heap);
-
-            *translation.y_mut() += Block::SIZE;
-        }
-
-        spawn_current_tetromino(commands, materials);
-    }
-}
-
-// -----------------
-// UTILITY FUNCTIONS
-// -----------------
-
-fn rotate_tetromino_block(tetromino_block: &mut Tetromino, matrix_size: i32, clockwise: bool) {
-    let orig_x = tetromino_block.index.x;
-    let orig_y = tetromino_block.index.y;
-    let matrix_size = matrix_size - 1;
-
-    let x = orig_x;
-    if clockwise {
-        tetromino_block.index.x = orig_y;
-        tetromino_block.index.y = matrix_size - x;
-    } else {
-        tetromino_block.index.x = matrix_size - orig_y;
-        tetromino_block.index.y = orig_x;
-    }
-}
-
-fn spawn_current_tetromino(
-    mut commands: Commands,
-    mut materials: ResMut<Assets<ColorMaterial>>,
-) {
-    let blocks = Tetromino::blocks_from_type(rand::random());
-    for block in blocks.into_iter() {
-        commands
-            .spawn(SpriteComponents {
-                material: materials.add(Color::rgb(
-                    block.0.color.r,
-                    block.0.color.g,
-                    block.0.color.b
-                ).into()),
-                sprite: Sprite {
-                    size: Vec2::new(Block::SIZE, Block::SIZE),
-                },
-                translation: Translation(Vec3::new(
-                    (block.1.index.x as f32 - 1.5) * Block::SIZE,
-                    (block.1.index.y as f32 + 9.5) * Block::SIZE,
-                    1.0,
-                )),
-                ..Default::default()
-            })
-            .with_bundle(block)
-            .with(CurrentTetromino)
-        ;
-    }
-}
-
 impl Distribution<TetrominoType> for Standard {
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> TetrominoType {
         match rng.gen_range(0, 7) {
-            0 => TetrominoType::Line,
-            1 => TetrominoType::Square,
+            0 => TetrominoType::I,
+            1 => TetrominoType::O,
             2 => TetrominoType::T,
             3 => TetrominoType::S,
             4 => TetrominoType::Z,
