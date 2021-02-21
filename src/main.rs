@@ -9,11 +9,11 @@ use std::collections::HashMap;
 
 fn main() {
     App::build()
-        .add_default_plugins()
-        .add_resource(SoftDropTimer(Timer::from_seconds(0.750)))
-        .add_resource(PrintInfoTimer(Timer::from_seconds(1.0)))
+        .add_plugins(DefaultPlugins)
+        .add_resource(SoftDropTimer(Timer::from_seconds(0.750, true)))
+        .add_resource(PrintInfoTimer(Timer::from_seconds(1.0, true)))
         .add_startup_system(setup.system())
-        // .add_system(print_info.system())
+        .add_system(print_info.system())
         .add_system(move_current_tetromino.system())
         .add_system(update_block_sprites.system())
         .run();
@@ -71,7 +71,7 @@ impl Block {
 }
 
 fn setup(
-    mut commands: Commands,
+    commands: &mut Commands,
     mut materials: ResMut<Assets<ColorMaterial>>
 ) {
     let matrix = Matrix {
@@ -80,18 +80,16 @@ fn setup(
     };
 
     commands
-        .spawn(Camera2dComponents::default())
-        .spawn(UiCameraComponents::default())
+        .spawn(Camera2dBundle::default())
+        .spawn(CameraUiBundle::default())
     ;
 
-    spawn_current_tetromino(&mut commands, &matrix, &mut materials);
+    spawn_current_tetromino(commands, &matrix, &mut materials);
 
     commands
-        .spawn(SpriteComponents {
+        .spawn(SpriteBundle {
             material: materials.add(Color::rgb(0.0, 0.0, 0.0).into()),
-            sprite: Sprite {
-                size: Vec2::new(matrix.width as f32 * Block::SIZE, matrix.height as f32 * Block::SIZE),
-            },
+            sprite: Sprite::new(Vec2::new(matrix.width as f32 * Block::SIZE, matrix.height as f32 * Block::SIZE)),
             ..Default::default()
         })
         .with(matrix)
@@ -101,23 +99,22 @@ fn setup(
 fn print_info(
     time: Res<Time>,
     mut timer: ResMut<PrintInfoTimer>,
-    mut matrix_query: Query<(&Matrix, &Sprite, &Translation)>,
-    mut current_query: Query<(&MatrixPosition, &Tetromino, &CurrentTetromino)>
+    mut matrix_query: Query<(&Matrix, &Sprite, &Transform)>,
+    mut current_query: Query<(Entity, &MatrixPosition, &Tetromino, &CurrentTetromino)>
 ) {
-    timer.0.tick(time.delta_seconds);
+    timer.0.tick(time.delta_seconds());
 
-    if timer.0.finished {
-        for (position, tetromino, _current) in &mut current_query.iter() {
+    if timer.0.just_finished() {
+        for (entity, position, tetromino, _current) in current_query.iter_mut() {
             println!("Current matrix_pos: {:?}", position);
             println!("Current tetromino: {:?}", tetromino);
+            println!("{:?}", entity);
         }
-        println!("");
-        timer.0.reset();
     }
 }
 
 fn move_current_tetromino(
-    mut commands: Commands,
+    commands: &mut Commands,
     mut materials: ResMut<Assets<ColorMaterial>>,
     time: Res<Time>,
     mut soft_drop_timer: ResMut<SoftDropTimer>,
@@ -128,32 +125,32 @@ fn move_current_tetromino(
 ) {
     // Store current positions in map by entity ID
     let mut prev_positions: HashMap<u32, (i32, i32)> = HashMap::new();
-    for (entity, position, _tetromino, _current) in &mut current_query.iter() {
+    for (entity, position, _tetromino, _current) in current_query.iter_mut() {
         prev_positions.insert(entity.id(), (position.x, position.y));
     }
 
     if keyboard_input.just_pressed(KeyCode::I) || keyboard_input.just_pressed(KeyCode::Up) {
         while check_tetromino_positions(&mut current_query, &mut heap_query) {
-            for (_entity, mut position, _tetromino, _current) in &mut current_query.iter() {
+            for (_entity, mut position, _tetromino, _current) in current_query.iter_mut() {
                 position.y -= 1;
             }
         }
 
-        for (entity, mut position, _tetromino, _current) in &mut current_query.iter() {
+        for (entity, mut position, _tetromino, _current) in current_query.iter_mut() {
             position.y += 1;
             commands.remove_one::<CurrentTetromino>(entity);
             commands.insert_one(entity, Heap);
         }
 
-        for matrix in &mut matrix_query.iter() {
-            spawn_current_tetromino(&mut commands, matrix, &mut materials);
+        for matrix in matrix_query.iter_mut() {
+            spawn_current_tetromino(commands, matrix, &mut materials);
         }
 
         return;
     }
 
     // Movement
-    soft_drop_timer.0.tick(time.delta_seconds);
+    soft_drop_timer.0.tick(time.delta_seconds());
 
     let mut move_x = 0;
     let mut move_y = 0;
@@ -165,13 +162,8 @@ fn move_current_tetromino(
         move_x += 1;
     }
 
-    if keyboard_input.just_pressed(KeyCode::K) || keyboard_input.just_pressed(KeyCode::Down) || soft_drop_timer.0.finished {
+    if keyboard_input.just_pressed(KeyCode::K) || keyboard_input.just_pressed(KeyCode::Down) || soft_drop_timer.0.just_finished() {
         move_y -= 1;
-        soft_drop_timer.0.reset();
-    }
-
-    if soft_drop_timer.0.finished {
-        soft_drop_timer.0.reset();
     }
 
     let mut should_rotate: Option<bool> = None;
@@ -186,7 +178,7 @@ fn move_current_tetromino(
     let mut x_over = 0;
     let mut y_over = 0;
 
-    for (_entity, mut position, mut tetromino, _current) in &mut current_query.iter() {
+    for (_entity, mut position, mut tetromino, _current) in current_query.iter_mut() {
         let mut move_x = move_x;
         let mut move_y = move_y;
 
@@ -203,7 +195,7 @@ fn move_current_tetromino(
         }
 
         // Bounds
-        for matrix in &mut matrix_query.iter() {
+        for matrix in matrix_query.iter_mut() {
             if position.x + move_x < 0 {
                 x_over = (position.x + move_x).min(x_over);
 
@@ -216,7 +208,7 @@ fn move_current_tetromino(
         position.y += move_y;
     }
 
-    for (_entity, mut position, mut tetromino, _current) in &mut current_query.iter() {
+    for (_entity, mut position, mut tetromino, _current) in current_query.iter_mut() {
         position.x -= x_over;
         position.y -= y_over;
     }
@@ -237,7 +229,7 @@ fn move_current_tetromino(
             ];
 
             for try_move in try_moves.iter() {
-                for (_entity, mut position, _tetromino, _current) in &mut current_query.iter() {
+                for (_entity, mut position, _tetromino, _current) in current_query.iter_mut() {
                     position.x += try_move.0;
                     position.y += try_move.1;
                 }
@@ -249,18 +241,18 @@ fn move_current_tetromino(
             }
         } else {
             // Revert movement and add to heap
-            for (entity, _position, _tetromino, _current) in &mut current_query.iter() {
+            for (entity, _position, _tetromino, _current) in current_query.iter_mut() {
                 commands.remove_one::<CurrentTetromino>(entity);
                 commands.insert_one(entity, Heap);
             }
 
-            for matrix in &mut matrix_query.iter() {
-                spawn_current_tetromino(&mut commands, matrix, &mut materials);
+            for matrix in matrix_query.iter_mut() {
+                spawn_current_tetromino(commands, matrix, &mut materials);
             }
         }
 
         if should_revert {
-            for (entity, mut position, _tetromino, _current) in &mut current_query.iter() {
+            for (entity, mut position, _tetromino, _current) in current_query.iter_mut() {
                 let prev_position = prev_positions.get(&entity.id()).unwrap();
                 position.x = prev_position.0;
                 position.y = prev_position.1;
@@ -271,15 +263,16 @@ fn move_current_tetromino(
 
 fn update_block_sprites(
     mut matrix_query: Query<(&Matrix, &Sprite)>,
-    mut block_query: Query<(&MatrixPosition, &mut Translation)>
+    mut block_query: Query<(&MatrixPosition, &mut Transform)>
 ) {
-    for (_matrix, matrix_sprite) in &mut matrix_query.iter() {
-        for (position, mut translation) in &mut block_query.iter() {
-            let new_x: f32 = ((position.x as f32 * Block::SIZE) - (matrix_sprite.size.x() * 0.5)) + (Block::SIZE * 0.5);
-            let new_y: f32 = (matrix_sprite.size.y() * -0.5) + (position.y as f32 * Block::SIZE) + (Block::SIZE * 0.5);
+    for (_matrix, matrix_sprite) in matrix_query.iter_mut() {
+        for (position, mut transform) in block_query.iter_mut() {
+            let new_x: f32 = ((position.x as f32 * Block::SIZE) - (matrix_sprite.size.x * 0.5)) + (Block::SIZE * 0.5);
+            let new_y: f32 = (matrix_sprite.size.y * -0.5) + (position.y as f32 * Block::SIZE) + (Block::SIZE * 0.5);
 
-            *translation.x_mut() = new_x;
-            *translation.y_mut() = new_y;
+            let translation = &mut transform.translation;
+            translation.x = new_x;
+            translation.y = new_y;
         }
     }
 }
@@ -307,12 +300,12 @@ fn check_tetromino_positions(
     current_query: &mut Query<(Entity, &mut MatrixPosition, &mut Tetromino, &CurrentTetromino)>,
     heap_query: &mut Query<(&mut MatrixPosition, &Heap)>
 ) -> bool {
-    for (_entity, position, _tetromino, _current) in &mut current_query.iter() {
+    for (_entity, position, _tetromino, _current) in current_query.iter_mut() {
         if position.y < 0 {
             return false;
         }
 
-        for (heap_position, _heap) in &mut heap_query.iter() {
+        for (heap_position, _heap) in heap_query.iter_mut() {
             if position.x == heap_position.x && position.y == heap_position.y {
                 return false;
             }
@@ -331,16 +324,14 @@ fn spawn_current_tetromino(
     for block in blocks.into_iter() {
         let tetromino_matrix_size = Tetromino::SIZES[block.1.tetromino_type as usize];
         commands
-            .spawn(SpriteComponents {
+            .spawn(SpriteBundle {
                 material: materials.add(Color::rgb(
-                    block.0.color.r,
-                    block.0.color.g,
-                    block.0.color.b
+                    block.0.color.r(),
+                    block.0.color.g(),
+                    block.0.color.b()
                 ).into()),
-                sprite: Sprite {
-                    size: Vec2::new(Block::SIZE, Block::SIZE),
-                },
-                translation: Translation(Vec3::new(0.0, 0.0, 1.0)),
+                sprite: Sprite::new(Vec2::new(Block::SIZE, Block::SIZE)),
+                transform: Transform::from_translation(Vec3::new(0.0, 0.0, 1.0)),
                 ..Default::default()
             })
             .with(CurrentTetromino)
